@@ -112,6 +112,18 @@ export type UserRole = 'user' | 'admin';
 export type PurchaseType = 'one_time' | 'subscription';
 export type RsvpResponse = 'yes' | 'no' | 'maybe';
 export type TemplateCategory = 'birthday' | 'wedding' | 'party' | 'corporate' | 'holiday' | 'other';
+export type TemplateType = 'card' | 'microsite';
+export type TemplatePreviewMode = 'inline' | 'iframe';
+export type ConfigFieldType = 'text' | 'textarea' | 'date' | 'time' | 'url' | 'select' | 'toggle' | 'range' | 'color';
+
+export type JsonPrimitive = string | number | boolean | null;
+export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+
+export interface ConfigOption {
+  label: string;
+  value: string;
+  isPro?: boolean;
+}
 
 export interface User {
   uid: string;
@@ -130,14 +142,21 @@ export interface TemplateConfigSchema {
   colors: ColorSchema[];
   fonts: FontSchema[];
   animations: AnimationSchema[];
+  assets?: AssetControlSchema[];      // stamps, stickers, uploads, gallery images
+  sections?: SectionSchema[];         // used by future microsite templates
 }
 
 export interface FieldSchema {
   key: string;         // e.g. "recipientName"
   label: string;       // e.g. "Recipient Name"
-  type: 'text' | 'textarea' | 'date' | 'time' | 'url';
+  type: ConfigFieldType;
   placeholder?: string;
   maxLength?: number;
+  options?: ConfigOption[];
+  min?: number;
+  max?: number;
+  step?: number;
+  isPro?: boolean;
   required: boolean;
 }
 
@@ -150,22 +169,42 @@ export interface ColorSchema {
 export interface FontSchema {
   key: string;
   label: string;
-  options: { label: string; value: string }[];
+  options: ConfigOption[];
   default: string;
+  isPro?: boolean;
 }
 
 export interface AnimationSchema {
   key: string;
   label: string;
-  type: 'range';
-  min: number;
-  max: number;
-  step: number;
-  default: number;
+  type: 'range' | 'select';
+  min?: number;
+  max?: number;
+  step?: number;
+  options?: ConfigOption[];
+  default: string | number;
+  isPro?: boolean;
+}
+
+export interface AssetControlSchema {
+  key: string;
+  label: string;
+  type: 'stamp' | 'sticker' | 'image_upload' | 'gallery_upload';
+  collection?: 'stampPacks' | 'stickerPacks';
+  maxItems?: number;
+  isPro?: boolean;
+}
+
+export interface SectionSchema {
+  sectionKey: string;
+  label: string;
+  defaultEnabled: boolean;
+  defaultOrder: number;
+  fields: FieldSchema[];
 }
 
 export interface InvitationConfig {
-  [key: string]: string | number | boolean;
+  [key: string]: JsonValue | undefined;
   // Dynamic — populated from TemplateConfigSchema
   // Common fields:
   // recipientName, message, date, time, venue, hostName
@@ -175,14 +214,31 @@ export interface InvitationConfig {
   rsvpEnabled: boolean;
 }
 
+export interface MicrositeSectionConfig {
+  [key: string]: JsonValue;
+  sectionKey: string;
+  enabled: boolean;
+  order: number;
+  fields: Record<string, JsonValue>;
+}
+
+export interface MicrositeConfig extends InvitationConfig {
+  sections: MicrositeSectionConfig[];
+  globalFont: string;
+  globalPrimaryColor: string;
+  globalAccentColor: string;
+}
+
 export interface Template {
   id: string;
   name: string;
   description: string;
   category: TemplateCategory;
+  templateType: TemplateType;
   price: number;            // in cents, 0 = free
   monthlyPrice: number;     // in cents
   componentKey: string;     // maps to React component in packages/templates
+  previewMode: TemplatePreviewMode;
   thumbnailUrl: string;
   previewUrl?: string;      // optional video preview
   configSchema: TemplateConfigSchema;
@@ -208,6 +264,7 @@ export interface Invitation {
   userId: string;
   templateId: string;
   componentKey: string;     // registry key used to render the template component
+  templateType: TemplateType;
   slug: string;             // unique — used in /i/[slug]
   config: InvitationConfig;
   rsvpDeadline?: Date;
@@ -225,7 +282,35 @@ export interface Rsvp {
   email: string;
   response: RsvpResponse;
   message?: string;
+  fields?: Record<string, JsonValue>; // future full RSVP fields: meal, +1, song request, etc.
   respondedAt: Date;
+}
+
+export interface Stamp {
+  key: string;
+  label: string;
+  svgKey: string;
+  packId: string;
+}
+
+export interface StampPack {
+  id: string;
+  name: string;
+  category: 'seasonal' | 'occasions' | 'greetings' | 'cultural' | 'fun';
+  thumbnailUrl: string;
+  isPro: boolean;
+  stamps: Stamp[];
+  createdAt: Date;
+}
+
+export interface StickerPack {
+  id: string;
+  name: string;
+  category: StampPack['category'];
+  thumbnailUrl: string;
+  isPro: boolean;
+  stickers: Stamp[];
+  createdAt: Date;
 }
 ```
 
@@ -316,11 +401,12 @@ Each template is a self-contained React component accepting a `config` prop.
 Create `packages/templates/src/types.ts`:
 
 ```typescript
-import type { InvitationConfig, TemplateConfigSchema } from '@vibeinvite/types';
+import type { InvitationConfig, TemplateConfigSchema, TemplatePreviewMode, TemplateType } from '@vibeinvite/types';
 
 export interface TemplateProps {
   config: InvitationConfig;
   isPreview?: boolean;    // true = editor preview mode (no real RSVP)
+  renderMode?: 'editor' | 'public';
   onRsvp?: (data: RsvpFormData) => Promise<void>;
 }
 
@@ -329,10 +415,13 @@ export interface RsvpFormData {
   email: string;
   response: 'yes' | 'no' | 'maybe';
   message?: string;
+  fields?: Record<string, unknown>;
 }
 
 export interface TemplateRegistration {
   componentKey: string;
+  templateType: TemplateType;
+  previewMode: TemplatePreviewMode; // card templates render inline; GSAP microsites use iframe preview in editor
   component: React.ComponentType<TemplateProps>;
   configSchema: TemplateConfigSchema;
   defaultConfig: InvitationConfig;
@@ -349,6 +438,8 @@ import { EnvelopeTemplate, envelopeSchema, envelopeDefaults } from './envelope/E
 export const templateRegistry: Record<string, TemplateRegistration> = {
   envelope: {
     componentKey: 'envelope',
+    templateType: 'card',
+    previewMode: 'inline',
     component: EnvelopeTemplate,
     configSchema: envelopeSchema,
     defaultConfig: envelopeDefaults,
@@ -366,7 +457,7 @@ Create `packages/templates/src/envelope/EnvelopeTemplate.tsx`:
 ```typescript
 'use client';
 import React, { useState } from 'react';
-import type { TemplateProps } from '../types';
+import type { RsvpFormData, TemplateProps } from '../types';
 import type { TemplateConfigSchema, InvitationConfig } from '@vibeinvite/types';
 import './envelope.css';
 
@@ -398,7 +489,25 @@ export const envelopeSchema: TemplateConfigSchema = {
     },
   ],
   animations: [
+    {
+      key: 'entranceAnimation',
+      label: 'Entrance Animation',
+      type: 'select',
+      default: 'float',
+      options: [
+        { label: 'Float', value: 'float' },
+        { label: 'Drop', value: 'drop' },
+        { label: 'Slide Left', value: 'slide_left', isPro: true },
+        { label: 'Slide Right', value: 'slide_right', isPro: true },
+        { label: 'Spin Drop', value: 'spin_drop', isPro: true },
+        { label: 'Typewriter', value: 'typewriter', isPro: true },
+      ],
+    },
     { key: 'floatSpeed', label: 'Float Speed', type: 'range', min: 1, max: 5, step: 0.5, default: 3 },
+  ],
+  assets: [
+    { key: 'stampKey', label: 'Stamp', type: 'stamp', collection: 'stampPacks' },
+    { key: 'stickerSlots', label: 'Stickers', type: 'sticker', collection: 'stickerPacks', isPro: true },
   ],
 };
 
@@ -414,7 +523,17 @@ export const envelopeDefaults: InvitationConfig = {
   paperColor:      '#FFFBF0',
   backgroundColor: '#fce4ec',
   displayFont:     'Playfair Display',
+  entranceAnimation: 'float',
   floatSpeed:      3,
+  envelopeShape:   'classic',
+  paperTexture:    'plain',
+  stampKey:        'default_heart',
+  stickerSlots: {
+    envelopeTopLeft: null,
+    envelopeBottomRight: null,
+    letterTopRight: null,
+    letterBottomLeft: null,
+  },
   rsvpEnabled:     true,
 };
 
@@ -429,15 +548,23 @@ export function EnvelopeTemplate({ config, isPreview = false, onRsvp }: Template
     setTimeout(() => setShowModal(true), 1200);
   };
 
+  const entranceAnimation = typeof config.entranceAnimation === 'string' ? config.entranceAnimation : 'float';
+  const primaryColor = typeof config.primaryColor === 'string' ? config.primaryColor : '#FFD6C0';
+  const accentColor = typeof config.accentColor === 'string' ? config.accentColor : '#B5456A';
+  const paperColor = typeof config.paperColor === 'string' ? config.paperColor : '#FFFBF0';
+  const backgroundColor = typeof config.backgroundColor === 'string' ? config.backgroundColor : '#fce4ec';
+
   return (
     <div
-      className="envelope-scene"
-      style={{ '--primary': config.primaryColor, '--accent': config.accentColor,
-               '--paper': config.paperColor, '--bg': config.backgroundColor } as React.CSSProperties}
+      className={`envelope-scene envelope-${entranceAnimation}`}
+      style={{ '--primary': primaryColor, '--accent': accentColor,
+               '--paper': paperColor, '--bg': backgroundColor } as React.CSSProperties}
     >
       {/* Envelope, animations, modal, RSVP form */}
       {/* Port the full HTML/CSS/JS from the original envelope implementation here */}
       {/* Replace hardcoded strings with config.recipientName, config.message etc. */}
+      {/* Keep envelope shape and stamp rendering behind small sub-components:
+          ClassicEnvelope, SquareEnvelope, VintageEnvelope, ModernEnvelope, StampRenderer. */}
 
       {/* RSVP Form — shown inside modal when rsvpEnabled */}
       {config.rsvpEnabled && showRsvp && !isPreview && (
@@ -447,7 +574,7 @@ export function EnvelopeTemplate({ config, isPreview = false, onRsvp }: Template
   );
 }
 
-function RsvpForm({ onSubmit, onClose }: { onSubmit: (data: any) => Promise<void>; onClose: () => void }) {
+function RsvpForm({ onSubmit, onClose }: { onSubmit: (data: RsvpFormData) => Promise<void>; onClose: () => void }) {
   // Implement RSVP form UI here
   return <div className="rsvp-form">{/* form fields */}</div>;
 }
@@ -572,6 +699,17 @@ service cloud.firestore {
     // Templates — anyone can read published ones, only admin can write
     match /templates/{templateId} {
       allow read: if resource.data.isPublished == true;
+      allow write: if isAdmin();
+    }
+
+    // Decorative asset packs — public can read published/free metadata, admin manages packs
+    match /stampPacks/{packId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /stickerPacks/{packId} {
+      allow read: if true;
       allow write: if isAdmin();
     }
 
@@ -850,21 +988,25 @@ export default async function InvitationPage({ params }: Props) {
   if (!template) notFound();
 
   const TemplateComponent = template.component;
+  const isMicrosite = template.templateType === 'microsite';
 
   return (
-    <TemplateComponent
-      config={invitation.config}
-      isPreview={false}
-      onRsvp={async (data) => {
-        'use server';
-        const res = await fetch(`${process.env.NEXT_PUBLIC_WEB_APP_URL}/api/rsvp/${invitation.id}`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(data),
-        });
-        if (!res.ok) throw new Error('Unable to submit RSVP');
-      }}
-    />
+    <main className={isMicrosite ? 'microsite-page' : 'card-page'}>
+      <TemplateComponent
+        config={invitation.config}
+        isPreview={false}
+        renderMode="public"
+        onRsvp={async (data) => {
+          'use server';
+          const res = await fetch(`${process.env.NEXT_PUBLIC_WEB_APP_URL}/api/rsvp/${invitation.id}`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(data),
+          });
+          if (!res.ok) throw new Error('Unable to submit RSVP');
+        }}
+      />
+    </main>
   );
 }
 ```
@@ -893,9 +1035,9 @@ export function generateSlug(): string {
 
 The editor uses a split-pane layout:
 - **Left**: config form (fields, color pickers, font selectors, animation sliders)
-- **Right**: live `<TemplateComponent config={liveConfig} isPreview={true} />`
+- **Right**: inline preview for card templates, iframe preview for microsite templates
 
-Config changes update React state → immediately re-render the preview.
+Config changes update React state → immediately re-render the card preview. Microsite templates should use a scaled iframe preview route so GSAP/ScrollTrigger never enter the main editor bundle.
 
 ```typescript
 // apps/web/app/(app)/editor/[templateId]/page.tsx
@@ -920,6 +1062,7 @@ export default function EditorPage({ params }: { params: { templateId: string } 
   };
 
   const TemplateComponent = template!.component;
+  const useIframePreview = template!.previewMode === 'iframe';
 
   return (
     <div className="editor-layout">
@@ -932,7 +1075,15 @@ export default function EditorPage({ params }: { params: { templateId: string } 
         <button onClick={handlePublish}>Generate Link & Publish</button>
       </aside>
       <main className="editor-preview">
-        <TemplateComponent config={config} isPreview={true} />
+        {useIframePreview ? (
+          <iframe
+            title="Invitation preview"
+            src={`/i/preview/${templateRecord.id}`}
+            className="editor-preview-frame"
+          />
+        ) : (
+          <TemplateComponent config={config} isPreview={true} renderMode="editor" />
+        )}
       </main>
     </div>
   );
@@ -949,6 +1100,47 @@ Before publishing or saving template metadata, validate `config` against the tem
 - Unknown config keys should be rejected unless explicitly allowed.
 
 Run this validation server-side in the publish API/server action even if the editor already validates on the client.
+
+---
+
+## Future-Ready Architecture for v1.1 Features
+
+The v1.1 feature request in `myMDfiles/vibeinvite-v1.1-feature-request_d9bf.md` adds advanced card customisation, decorative asset packs, and premium microsite templates. Build v1.0 with these seams now so v1.1 is additive instead of a rewrite:
+
+### Template model
+- Store `templateType: 'card' | 'microsite'` on every template and invitation.
+- Store `componentKey` separately from Firestore template id.
+- Store `previewMode: 'inline' | 'iframe'` in the template registry.
+- Use `TemplateConfigSchema` as the single source for editor controls, entitlement gates, validation, and defaults.
+
+### Config schema
+- Support `select`, `toggle`, `range`, `color`, asset controls, and section schemas from the start.
+- Allow object/array config values through `JsonValue` so stickers, galleries, and microsite sections fit the same `InvitationConfig`.
+- Add `isPro` flags to schema controls/options instead of hardcoding tier logic into UI components.
+- Validate config on the server against schema before publish and before paid template saves.
+
+### Card customization
+- Keep envelope geometry behind sub-components such as `ClassicEnvelope`, `SquareEnvelope`, `VintageEnvelope`, and `ModernEnvelope`.
+- Keep envelope open/close behavior in a shared `useEnvelopeAnimation` hook so shape variants can reuse it.
+- Treat stamps and stickers as renderer registries keyed by `svgKey`; Firestore stores pack metadata and unlock state, not raw SVG code.
+- Implement paper textures and entrance animations as CSS classes/keyframes inside `packages/templates`; avoid JS animation libraries for card templates.
+
+### Microsites
+- Premium microsites render through the same `/i/[slug]` public route but branch by `templateType`.
+- GSAP and ScrollTrigger belong only inside microsite components in `packages/templates`.
+- The editor should preview microsites through an iframe/preview route, not by importing GSAP into `apps/web`.
+- Model microsite sections as reorderable `MicrositeSectionConfig[]` records so hero/countdown/story/gallery/RSVP/travel sections can be toggled and reordered later.
+
+### Entitlements and pricing
+- Keep monthly plan access (`plan: 'free' | 'pro'`) separate from one-time purchases.
+- Use purchases to unlock premium microsite templates permanently.
+- Evaluate feature access through a central entitlement helper that accepts user, template, purchases, and schema option metadata.
+- Stripe webhooks remain the source of truth for both subscription plan changes and premium template purchases.
+
+### Storage
+- Add Firebase Storage rules when photo uploads are introduced.
+- Store uploaded microsite/gallery assets under owner-scoped paths such as `users/{userId}/invitations/{invitationId}/...`.
+- Persist only metadata and storage paths in Firestore; never store large image payloads in invitation config.
 
 ---
 
@@ -1005,6 +1197,20 @@ Work through these one session at a time:
 11. **Session 11** — Dashboard (invitation list, RSVP counts, view counts)
 12. **Session 12** — Admin template manager (upload, publish, configure schema)
 
+After v1.0 ships, continue with the v1.1 feature request:
+
+13. **Session 13** — Stamp pack Firestore collection + SVG stamp registry
+14. **Session 14** — Envelope shape variants using shared envelope animation hook
+15. **Session 15** — Entrance animation system using CSS keyframes
+16. **Session 16** — Paper textures + curated font pairing system
+17. **Session 17** — Sticker system phase 1 with fixed positions
+18. **Session 18** — Microsite renderer branch for `templateType: 'microsite'`
+19. **Session 19** — "Eternal" wedding microsite hero/countdown/event details
+20. **Session 20** — "Eternal" story/gallery with Firebase Storage upload flow
+21. **Session 21** — "Eternal" full RSVP, registry, travel, and footer sections
+22. **Session 22** — GSAP ScrollTrigger integration isolated to templates package
+23. **Session 23** — Microsite editor support: section toggle, reorder, iframe preview
+
 ---
 
 ## Cursor-Specific Instructions
@@ -1020,14 +1226,19 @@ Rules:
 - Shared Firebase config lives in packages/config. Use firebase-client.ts for browser code and firebase-admin.ts for server-only privileged code.
 - All invitation templates live in packages/templates. Each is a React component accepting a `config: InvitationConfig` prop.
 - Invitations store both `templateId` and `componentKey`; render templates with `componentKey`, never by assuming template id equals registry key.
+- Templates and invitations include `templateType`; card and microsite templates share routing but can render differently.
+- Config schemas must support future select/toggle/range/color/asset/section controls and object/array config values.
 - apps/web is the main app (auth, dashboard, editor, marketplace, admin).
 - apps/invitation is for public /i/[slug] routes only — keep it lean, no auth.
 - Always use TypeScript strict mode. No `any` unless absolutely necessary.
 - Use Tailwind for all UI in apps/. Template animations use raw CSS/CSS variables only — no Tailwind inside template components.
+- GSAP/ScrollTrigger is allowed only in microsite templates inside packages/templates; editor previews microsites through iframe routes.
 - All Firestore writes that involve money or permissions happen server-side via Admin SDK only (API routes). Never trust client-side writes for purchases.
 - Stripe webhooks are the source of truth for purchases. Verify signatures, process events idempotently, and never grant access based on a successful client redirect alone.
+- Keep subscription plan entitlements separate from one-time premium template purchases.
 - RSVPs are not publicly writable in Firestore. Public submissions must go through the validated and rate-limited /api/rsvp route.
 - Validate invitation config against the template schema server-side before publishing.
+- Store uploaded image/video files in Firebase Storage under owner-scoped paths and keep only metadata/storage paths in Firestore.
 - Use `nanoid` for slug generation. Slugs are 10 chars, lowercase alphanumeric.
 - OG metadata is generated server-side on /i/[slug] from the invitation config.
 ```
