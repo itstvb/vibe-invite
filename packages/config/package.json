@@ -1,0 +1,32 @@
+{
+  "name": "@vibeinvite/config",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./firebase-client": "./src/firebase-client.ts",
+    "./firebase-admin": "./src/firebase-admin.ts",
+    "./stripe": "./src/stripe.ts",
+    "./resend": "./src/resend.ts",
+    "./slug": "./src/slug.ts",
+    "./entitlements": "./src/entitlements.ts",
+    "./validate-template-config": "./src/validate-template-config.ts"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@vibeinvite/types": "workspace:*",
+    "firebase": "latest",
+    "firebase-admin": "latest",
+    "nanoid": "latest",
+    "resend": "latest",
+    "server-only": "latest",
+    "stripe": "latest"
+  },
+  "devDependencies": {
+    "typescript": "latest"
+  }
+}

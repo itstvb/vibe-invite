@@ -1,0 +1,79 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return signedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return signedIn()
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isOwner(userId)
+        && request.resource.data.keys().hasOnly([
+          'uid',
+          'email',
+          'displayName',
+          'photoURL',
+          'plan',
+          'role',
+          'createdAt'
+        ])
+        && request.resource.data.uid == userId
+        && request.resource.data.role == 'user'
+        && request.resource.data.plan == 'free';
+      allow update: if isOwner(userId)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName', 'photoURL']);
+      allow delete: if false;
+    }
+
+    match /templates/{templateId} {
+      allow read: if resource.data.isPublished == true;
+      allow write: if isAdmin();
+    }
+
+    match /stampPacks/{packId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /stickerPacks/{packId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /purchases/{purchaseId} {
+      allow read: if signedIn() && resource.data.userId == request.auth.uid;
+      allow write: if false;
+    }
+
+    match /processedStripeEvents/{eventId} {
+      allow read, write: if false;
+    }
+
+    match /invitations/{invitationId} {
+      allow read: if resource.data.isPublished == true
+        || (signedIn() && resource.data.userId == request.auth.uid);
+      allow create: if signedIn()
+        && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if signedIn()
+        && resource.data.userId == request.auth.uid;
+    }
+
+    match /rsvps/{rsvpId} {
+      allow create: if false;
+      allow read: if signedIn()
+        && get(/databases/$(database)/documents/invitations/$(resource.data.invitationId)).data.userId
+          == request.auth.uid;
+      allow update, delete: if false;
+    }
+  }
+}

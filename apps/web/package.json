@@ -1,0 +1,26 @@
+{
+  "name": "@vibeinvite/web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev --port 3000",
+    "build": "next build",
+    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@vibeinvite/config": "workspace:*",
+    "@vibeinvite/templates": "workspace:*",
+    "@vibeinvite/types": "workspace:*",
+    "@vibeinvite/ui": "workspace:*",
+    "next": "latest",
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "typescript": "latest"
+  }
+}
