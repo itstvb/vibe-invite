@@ -108,6 +108,7 @@ Create `packages/types/src/index.ts`:
 
 ```typescript
 export type Plan = 'free' | 'pro';
+export type UserRole = 'user' | 'admin';
 export type PurchaseType = 'one_time' | 'subscription';
 export type RsvpResponse = 'yes' | 'no' | 'maybe';
 export type TemplateCategory = 'birthday' | 'wedding' | 'party' | 'corporate' | 'holiday' | 'other';
@@ -118,7 +119,9 @@ export interface User {
   displayName: string;
   photoURL?: string;
   stripeCustomerId?: string;
+  stripeSubscriptionId?: string;
   plan: Plan;
+  role: UserRole;          // authorization role; admin is separate from billing plan
   createdAt: Date;
 }
 
@@ -204,6 +207,7 @@ export interface Invitation {
   id: string;
   userId: string;
   templateId: string;
+  componentKey: string;     // registry key used to render the template component
   slug: string;             // unique — used in /i/[slug]
   config: InvitationConfig;
   rsvpDeadline?: Date;
@@ -229,7 +233,7 @@ export interface Rsvp {
 
 ## packages/config — Firebase, Stripe, Resend
 
-Create `packages/config/src/firebase.ts`:
+Create `packages/config/src/firebase-client.ts` for browser/client usage:
 
 ```typescript
 import { initializeApp, getApps, getApp } from 'firebase/app';
@@ -253,6 +257,35 @@ export const db      = getFirestore(app);
 export const storage = getStorage(app);
 export default app;
 ```
+
+Create `packages/config/src/firebase-admin.ts` for server-only privileged usage:
+
+```typescript
+import { cert, getApps, initializeApp } from 'firebase-admin/app';
+import { getAuth } from 'firebase-admin/auth';
+import { getFirestore } from 'firebase-admin/firestore';
+import { getStorage } from 'firebase-admin/storage';
+
+const privateKey = process.env.FIREBASE_ADMIN_PRIVATE_KEY?.replace(/\\n/g, '\n');
+
+const adminApp = getApps().length
+  ? getApps()[0]
+  : initializeApp({
+      credential: cert({
+        projectId: process.env.FIREBASE_ADMIN_PROJECT_ID!,
+        clientEmail: process.env.FIREBASE_ADMIN_CLIENT_EMAIL!,
+        privateKey,
+      }),
+      storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET!,
+    });
+
+export const adminAuth = getAuth(adminApp);
+export const adminDb = getFirestore(adminApp);
+export const adminStorage = getStorage(adminApp);
+export default adminApp;
+```
+
+Only import `firebase-admin.ts` from server components, route handlers, server actions, or scripts. Do not import it into client components.
 
 Create `packages/config/src/stripe.ts`:
 
@@ -451,6 +484,7 @@ RESEND_FROM_EMAIL=hello@vibeinvite.com
 
 # App
 NEXT_PUBLIC_APP_URL=http://localhost:3000
+NEXT_PUBLIC_WEB_APP_URL=http://localhost:3000
 ```
 
 ### App Router Structure
@@ -486,6 +520,12 @@ apps/web/app/
 │   │   └── webhook/route.ts          # Handle Stripe events
 │   └── rsvp/
 │       └── [invitationId]/route.ts   # POST rsvp + send email
+```
+
+Keep public invitation rendering in the dedicated `apps/invitation` app only:
+
+```
+apps/invitation/app/
 └── i/
     └── [slug]/
         └── page.tsx                  # Public invitation page (SSR)
@@ -500,39 +540,62 @@ apps/web/app/
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
 
-    // Users — only the user can read/write their own doc
+    function isOwner(userId) {
+      return signedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return signedIn()
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // Users — users can manage profile fields only; role/plan/billing fields are server-owned
     match /users/{userId} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isOwner(userId)
+                    && request.resource.data.keys().hasOnly([
+                      'uid', 'email', 'displayName', 'photoURL', 'plan', 'role', 'createdAt'
+                    ])
+                    && request.resource.data.uid == userId
+                    && request.resource.data.role == 'user'
+                    && request.resource.data.plan == 'free';
+      allow update: if isOwner(userId)
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                      .hasOnly(['displayName', 'photoURL']);
+      allow delete: if false;
     }
 
     // Templates — anyone can read published ones, only admin can write
     match /templates/{templateId} {
       allow read: if resource.data.isPublished == true;
-      allow write: if request.auth != null
-                   && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.plan == 'admin';
+      allow write: if isAdmin();
     }
 
     // Purchases — user can read their own
     match /purchases/{purchaseId} {
-      allow read: if request.auth != null && resource.data.userId == request.auth.uid;
+      allow read: if signedIn() && resource.data.userId == request.auth.uid;
       allow write: if false; // Only server-side via Admin SDK (Stripe webhook)
     }
 
     // Invitations — user can CRUD their own, anyone can read published ones
     match /invitations/{invitationId} {
       allow read: if resource.data.isPublished == true
-                  || (request.auth != null && resource.data.userId == request.auth.uid);
-      allow create: if request.auth != null
+                  || (signedIn() && resource.data.userId == request.auth.uid);
+      allow create: if signedIn()
                     && request.resource.data.userId == request.auth.uid;
-      allow update, delete: if request.auth != null
+      allow update, delete: if signedIn()
                              && resource.data.userId == request.auth.uid;
     }
 
-    // RSVPs — anyone can create, only invitation owner can read
+    // RSVPs — public submissions go through /api/rsvp/[invitationId].
+    // The route validates, rate-limits, writes with Admin SDK, and sends email.
     match /rsvps/{rsvpId} {
-      allow create: if true; // public can RSVP
-      allow read: if request.auth != null
+      allow create: if false;
+      allow read: if signedIn()
                   && get(/databases/$(database)/documents/invitations/$(resource.data.invitationId)).data.userId
                      == request.auth.uid;
       allow update, delete: if false;
@@ -549,20 +612,29 @@ service cloud.firestore {
 ```typescript
 // apps/web/app/api/stripe/checkout/route.ts
 import { NextRequest, NextResponse } from 'next/server';
+import { adminAuth } from '@vibeinvite/config/firebase-admin';
 import { stripe } from '@vibeinvite/config/stripe';
-import { auth } from '@vibeinvite/config/firebase';
 
 export async function POST(req: NextRequest) {
-  const { templateId, type, priceId, userId, userEmail } = await req.json();
+  const token = req.headers.get('authorization')?.replace('Bearer ', '');
+  if (!token) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+
+  const { uid, email } = await adminAuth.verifyIdToken(token);
+  const { templateId, type, priceId } = await req.json();
+
+  // Validate type, priceId, templateId, and user entitlement server-side before checkout.
+  if (!['one_time', 'subscription'].includes(type) || !priceId) {
+    return NextResponse.json({ error: 'Invalid checkout request' }, { status: 400 });
+  }
 
   if (type === 'one_time') {
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
-      customer_email: userEmail,
+      customer_email: email,
       line_items: [{ price: priceId, quantity: 1 }],
       success_url: `${process.env.NEXT_PUBLIC_APP_URL}/dashboard?success=true`,
       cancel_url:  `${process.env.NEXT_PUBLIC_APP_URL}/templates`,
-      metadata: { userId, templateId, type: 'one_time' },
+      metadata: { userId: uid, templateId, type: 'one_time' },
     });
     return NextResponse.json({ url: session.url });
   }
@@ -570,11 +642,11 @@ export async function POST(req: NextRequest) {
   if (type === 'subscription') {
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      customer_email: userEmail,
+      customer_email: email,
       line_items: [{ price: priceId, quantity: 1 }],
       success_url: `${process.env.NEXT_PUBLIC_APP_URL}/dashboard?success=true`,
       cancel_url:  `${process.env.NEXT_PUBLIC_APP_URL}/templates`,
-      metadata: { userId, type: 'subscription' },
+      metadata: { userId: uid, type: 'subscription' },
     });
     return NextResponse.json({ url: session.url });
   }
@@ -586,43 +658,133 @@ export async function POST(req: NextRequest) {
 ### POST /api/stripe/webhook
 ```typescript
 // apps/web/app/api/stripe/webhook/route.ts
-// Handle: checkout.session.completed → write purchase to Firestore
-// Handle: customer.subscription.deleted → downgrade user plan
-// Always verify stripe signature before processing
+import { NextRequest, NextResponse } from 'next/server';
+import { adminDb } from '@vibeinvite/config/firebase-admin';
+import { stripe, STRIPE_WEBHOOK_SECRET } from '@vibeinvite/config/stripe';
+
+export async function POST(req: NextRequest) {
+  const body = await req.text();
+  const signature = req.headers.get('stripe-signature');
+  if (!signature) return NextResponse.json({ error: 'Missing signature' }, { status: 400 });
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(body, signature, STRIPE_WEBHOOK_SECRET);
+  } catch {
+    return NextResponse.json({ error: 'Invalid signature' }, { status: 400 });
+  }
+
+  // Idempotency: Stripe may retry events, so record processed event ids.
+  const eventRef = adminDb.collection('processedStripeEvents').doc(event.id);
+  const eventSnap = await eventRef.get();
+  if (eventSnap.exists) return NextResponse.json({ received: true });
+
+  await adminDb.runTransaction(async (tx) => {
+    const existing = await tx.get(eventRef);
+    if (existing.exists) return;
+
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const { userId, templateId, type } = session.metadata ?? {};
+
+      if (type === 'one_time' && userId && templateId) {
+        const purchaseRef = adminDb.collection('purchases').doc(session.id);
+        tx.set(purchaseRef, {
+          userId,
+          templateId,
+          type: 'one_time',
+          stripePaymentIntentId: session.payment_intent,
+          createdAt: new Date(),
+        });
+      }
+
+      if (type === 'subscription' && userId) {
+        tx.update(adminDb.collection('users').doc(userId), {
+          plan: 'pro',
+          stripeCustomerId: session.customer,
+          stripeSubscriptionId: session.subscription,
+        });
+      }
+    }
+
+    if (event.type === 'customer.subscription.deleted') {
+      const subscription = event.data.object;
+      const usersSnap = await tx.get(
+        adminDb
+          .collection('users')
+          .where('stripeSubscriptionId', '==', subscription.id)
+          .limit(1)
+      );
+
+      if (!usersSnap.empty) {
+        tx.update(usersSnap.docs[0].ref, {
+          plan: 'free',
+          stripeSubscriptionId: null,
+        });
+      }
+    }
+
+    tx.set(eventRef, { processedAt: new Date(), type: event.type });
+  });
+
+  return NextResponse.json({ received: true });
+}
 ```
 
 ### POST /api/rsvp/[invitationId]
 ```typescript
 // apps/web/app/api/rsvp/[invitationId]/route.ts
 import { NextRequest, NextResponse } from 'next/server';
-import { db } from '@vibeinvite/config/firebase';
+import { adminDb } from '@vibeinvite/config/firebase-admin';
 import { resend } from '@vibeinvite/config/resend';
-import { addDoc, collection, getDoc, doc, serverTimestamp } from 'firebase/firestore';
+
+const VALID_RESPONSES = new Set(['yes', 'no', 'maybe']);
+
+async function rateLimit(req: NextRequest, invitationId: string) {
+  // Implement with a durable store such as Upstash Redis, Vercel KV, or Firestore counters.
+  // Key by invitationId + IP hash + email hash; return false when the limit is exceeded.
+  return true;
+}
 
 export async function POST(req: NextRequest, { params }: { params: { invitationId: string } }) {
   const { name, email, response, message } = await req.json();
   const { invitationId } = params;
 
-  // 1. Write RSVP to Firestore
-  await addDoc(collection(db, 'rsvps'), {
+  if (!name || !email || !VALID_RESPONSES.has(response)) {
+    return NextResponse.json({ error: 'Invalid RSVP' }, { status: 400 });
+  }
+
+  if (!(await rateLimit(req, invitationId))) {
+    return NextResponse.json({ error: 'Too many requests' }, { status: 429 });
+  }
+
+  // 1. Get invitation first; only published invitations can receive RSVPs.
+  const invitationSnap = await adminDb.collection('invitations').doc(invitationId).get();
+  const invitation = invitationSnap.data();
+  if (!invitation || invitation.isPublished !== true) {
+    return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  }
+
+  if (invitation.rsvpDeadline?.toDate?.() && invitation.rsvpDeadline.toDate() < new Date()) {
+    return NextResponse.json({ error: 'RSVP deadline has passed' }, { status: 400 });
+  }
+
+  // 2. Write RSVP using Admin SDK; public clients cannot write directly to Firestore.
+  await adminDb.collection('rsvps').add({
     invitationId, name, email, response,
     message: message ?? '',
-    respondedAt: serverTimestamp(),
+    respondedAt: new Date(),
   });
 
-  // 2. Get invitation to find creator's email
-  const invitationSnap = await getDoc(doc(db, 'invitations', invitationId));
-  const invitation = invitationSnap.data();
-  if (!invitation) return NextResponse.json({ error: 'Not found' }, { status: 404 });
-
-  const userSnap = await getDoc(doc(db, 'users', invitation.userId));
+  const userSnap = await adminDb.collection('users').doc(invitation.userId).get();
   const creator  = userSnap.data();
+  if (!creator?.email) return NextResponse.json({ success: true });
 
   // 3. Send email to creator via Resend
   await resend.emails.send({
     from: process.env.RESEND_FROM_EMAIL!,
     to:   creator?.email,
-    subject: `${name} just RSVP'd ${response.toUpperCase()} to your invitation 🎉`,
+    subject: `${name} just RSVP'd ${response.toUpperCase()} to your invitation`,
     html: `
       <h2>${name} responded: ${response}</h2>
       <p><strong>Email:</strong> ${email}</p>
@@ -643,8 +805,7 @@ export async function POST(req: NextRequest, { params }: { params: { invitationI
 
 ```typescript
 // apps/invitation/app/i/[slug]/page.tsx
-import { collection, query, where, getDocs } from 'firebase/firestore';
-import { db } from '@vibeinvite/config/firebase';
+import { adminDb } from '@vibeinvite/config/firebase-admin';
 import { getTemplate } from '@vibeinvite/templates/registry';
 import { notFound } from 'next/navigation';
 import type { Metadata } from 'next';
@@ -652,8 +813,13 @@ import type { Metadata } from 'next';
 interface Props { params: { slug: string } }
 
 async function getInvitation(slug: string) {
-  const q = query(collection(db, 'invitations'), where('slug', '==', slug), where('isPublished', '==', true));
-  const snap = await getDocs(q);
+  const snap = await adminDb
+    .collection('invitations')
+    .where('slug', '==', slug)
+    .where('isPublished', '==', true)
+    .limit(1)
+    .get();
+
   if (snap.empty) return null;
   return { id: snap.docs[0].id, ...snap.docs[0].data() } as any;
 }
@@ -678,9 +844,9 @@ export default async function InvitationPage({ params }: Props) {
   if (!invitation) notFound();
 
   // Increment view count (fire-and-forget)
-  // updateDoc(doc(db, 'invitations', invitation.id), { viewCount: increment(1) });
+  // adminDb.collection('invitations').doc(invitation.id).update({ viewCount: FieldValue.increment(1) });
 
-  const template = getTemplate(invitation.templateId);
+  const template = getTemplate(invitation.componentKey);
   if (!template) notFound();
 
   const TemplateComponent = template.component;
@@ -691,7 +857,12 @@ export default async function InvitationPage({ params }: Props) {
       isPreview={false}
       onRsvp={async (data) => {
         'use server';
-        // Call /api/rsvp/[invitationId] or server action here
+        const res = await fetch(`${process.env.NEXT_PUBLIC_WEB_APP_URL}/api/rsvp/${invitation.id}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(data),
+        });
+        if (!res.ok) throw new Error('Unable to submit RSVP');
       }}
     />
   );
@@ -735,12 +906,16 @@ import { ConfigPanel } from '@/components/editor/ConfigPanel';
 import { generateSlug } from '@vibeinvite/config/slug';
 
 export default function EditorPage({ params }: { params: { templateId: string } }) {
-  const template = getTemplate(params.templateId);
+  // Fetch the Firestore template record by params.templateId, then use its componentKey.
+  // Do not assume the Firestore template id is the same as the registry componentKey.
+  const templateRecord = { id: params.templateId, componentKey: 'envelope' };
+  const template = getTemplate(templateRecord.componentKey);
   const [config, setConfig] = useState(template!.defaultConfig);
 
   const handlePublish = async () => {
     const slug = generateSlug();
-    // Write invitation to Firestore with slug + config
+    // Validate config against template.configSchema before writing.
+    // Write invitation to Firestore with slug, templateId, componentKey, and config.
     // Redirect to /dashboard with success toast
   };
 
@@ -763,6 +938,17 @@ export default function EditorPage({ params }: { params: { templateId: string } 
   );
 }
 ```
+
+Before publishing or saving template metadata, validate `config` against the template's `TemplateConfigSchema`:
+
+- Required fields must be present and non-empty.
+- Field values must match the declared type.
+- Colors must be valid hex values.
+- Font values must be one of the schema options.
+- Animation values must stay within min/max/step.
+- Unknown config keys should be rejected unless explicitly allowed.
+
+Run this validation server-side in the publish API/server action even if the editor already validates on the client.
 
 ---
 
@@ -809,13 +995,13 @@ Work through these one session at a time:
 1. **Session 1** — Monorepo scaffold, packages/types, packages/config
 2. **Session 2** — Firebase Auth (login/signup pages + auth context)
 3. **Session 3** — Port envelope template to EnvelopeTemplate.tsx with config prop
-4. **Session 4** — Firestore service layer (CRUD for invitations, templates)
+4. **Session 4** — Firestore service layer, Admin SDK helpers, and security rules
 5. **Session 5** — Template marketplace page + purchase flow (Stripe checkout)
-6. **Session 6** — Stripe webhook handler (write purchases to Firestore)
-7. **Session 7** — Editor page (ConfigPanel + live preview)
-8. **Session 8** — Publish flow (slug generation, Firestore write, copy link UI)
+6. **Session 6** — Stripe webhook handler (signature verification, idempotency, purchases)
+7. **Session 7** — Editor page (ConfigPanel + live preview + config validation)
+8. **Session 8** — Publish flow (slug generation, validated Firestore write, copy link UI)
 9. **Session 9** — apps/invitation — public /i/[slug] SSR page
-10. **Session 10** — RSVP form on invitation + POST /api/rsvp + Resend email
+10. **Session 10** — RSVP form on invitation + rate-limited POST /api/rsvp + Resend email
 11. **Session 11** — Dashboard (invitation list, RSVP counts, view counts)
 12. **Session 12** — Admin template manager (upload, publish, configure schema)
 
@@ -831,15 +1017,17 @@ You are building VibeInvite, a digital invitation SaaS.
 Rules:
 - This is a pnpm Turborepo monorepo. Always use pnpm, never npm or yarn.
 - Shared types live in packages/types. Never duplicate types between apps.
-- Shared Firebase config lives in packages/config. Import from there, never re-initialize.
+- Shared Firebase config lives in packages/config. Use firebase-client.ts for browser code and firebase-admin.ts for server-only privileged code.
 - All invitation templates live in packages/templates. Each is a React component accepting a `config: InvitationConfig` prop.
+- Invitations store both `templateId` and `componentKey`; render templates with `componentKey`, never by assuming template id equals registry key.
 - apps/web is the main app (auth, dashboard, editor, marketplace, admin).
 - apps/invitation is for public /i/[slug] routes only — keep it lean, no auth.
 - Always use TypeScript strict mode. No `any` unless absolutely necessary.
 - Use Tailwind for all UI in apps/. Template animations use raw CSS/CSS variables only — no Tailwind inside template components.
 - All Firestore writes that involve money or permissions happen server-side via Admin SDK only (API routes). Never trust client-side writes for purchases.
-- Stripe webhooks are the source of truth for purchases. Never grant access based on a successful client redirect alone.
-- RSVPs are publicly writable in Firestore but rate-limit the /api/rsvp route.
+- Stripe webhooks are the source of truth for purchases. Verify signatures, process events idempotently, and never grant access based on a successful client redirect alone.
+- RSVPs are not publicly writable in Firestore. Public submissions must go through the validated and rate-limited /api/rsvp route.
+- Validate invitation config against the template schema server-side before publishing.
 - Use `nanoid` for slug generation. Slugs are 10 chars, lowercase alphanumeric.
 - OG metadata is generated server-side on /i/[slug] from the invitation config.
 ```
